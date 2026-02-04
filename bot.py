@@ -43,7 +43,13 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
 
-# TEXT_BACKEND: "ollama" for local model, "venice" for Venice API
+# Groq config
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# TEXT_BACKEND: "ollama" for local model, "venice" for Venice API, "groq" for Groq
 TEXT_BACKEND = os.getenv("TEXT_BACKEND", "venice")
 # VISION_BACKEND: separate backend for image description (defaults to TEXT_BACKEND)
 VISION_BACKEND = os.getenv("VISION_BACKEND", "")
@@ -79,6 +85,10 @@ When you see [IMAGE DESCRIPTION], someone posted a photo. React to it naturally.
 # ── Reply sanitization ────────────────────────────────────────────────────────
 def sanitize_reply(text: str) -> str:
     """Clean up LLM output before sending."""
+    # Strip <think>...</think> reasoning blocks (closed tags)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Strip unclosed <think> blocks (model hit token limit mid-thought)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     text = text.replace("\u2014", ",")              # em dash -> comma
     text = re.sub(r"\*([^*]+)\*", r"\1", text)      # *bold* -> bold
     text = text.replace("*", "")                     # nuke any remaining asterisks
@@ -457,11 +467,38 @@ async def ollama_chat(messages: list[dict]) -> str | None:
         return None
 
 
+# ── Groq API ─────────────────────────────────────────────────────────────────
+async def groq_chat(messages: list[dict], model: str = None) -> str | None:
+    """Call Groq chat completions (OpenAI-compatible)."""
+    model = model or GROQ_MODEL
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": 300,
+        "temperature": 0.9,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(GROQ_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Groq API error: {e}")
+        return None
+
+
 # ── Text chat dispatcher ─────────────────────────────────────────────────────
 async def text_chat(messages: list[dict]) -> str | None:
-    """Route text chat to the configured backend (ollama or venice)."""
+    """Route text chat to the configured backend (ollama, venice, or groq)."""
     if TEXT_BACKEND == "ollama":
         return await ollama_chat(messages)
+    if TEXT_BACKEND == "groq":
+        return await groq_chat(messages)
     return await venice_chat(messages)
 
 
@@ -593,11 +630,29 @@ async def ollama_describe_image(photo_bytes: bytes) -> str | None:
         return None
 
 
+async def groq_describe_image(photo_bytes: bytes) -> str | None:
+    """Use Groq vision model to describe an image."""
+    import base64
+    b64 = base64.b64encode(photo_bytes).decode()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": "Describe this image in 1-2 sentences. Be specific about what's happening."},
+            ],
+        }
+    ]
+    return await groq_chat(messages, model=GROQ_VISION_MODEL)
+
+
 async def describe_image(photo_bytes: bytes) -> str | None:
     """Route image description to the configured backend."""
     backend = VISION_BACKEND or TEXT_BACKEND
     if backend == "ollama":
         return await ollama_describe_image(photo_bytes)
+    if backend == "groq":
+        return await groq_describe_image(photo_bytes)
     return await venice_describe_image(photo_bytes)
 
 
@@ -1056,23 +1111,20 @@ async def handle_message(event: events.NewMessage.Event) -> None:
                 return
 
             # --- Backend / model switching commands ---
-            # "backend ollama" / "backend venice" / "use ollama" / "use venice"
-            backend_match = re.match(r"(?:backend|use)\s+(ollama|venice)\b", txt)
+            backend_match = re.match(r"(?:backend|use)\s+(ollama|venice|groq)\b", txt)
             if backend_match:
                 global TEXT_BACKEND
                 TEXT_BACKEND = backend_match.group(1)
                 await event.reply(f"text backend → {TEXT_BACKEND}")
                 return
 
-            # "vision backend ollama" / "vision backend venice"
-            vb_match = re.match(r"vision\s+(?:backend|use)\s+(ollama|venice)\b", txt)
+            vb_match = re.match(r"vision\s+(?:backend|use)\s+(ollama|venice|groq)\b", txt)
             if vb_match:
                 global VISION_BACKEND
                 VISION_BACKEND = vb_match.group(1)
                 await event.reply(f"vision backend → {VISION_BACKEND}")
                 return
 
-            # "model <name>" — sets the text model for the active backend
             model_match = re.match(r"model\s+(\S+)", txt)
             if model_match:
                 new_model = model_match.group(1)
@@ -1080,13 +1132,16 @@ async def handle_message(event: events.NewMessage.Event) -> None:
                     global OLLAMA_MODEL
                     OLLAMA_MODEL = new_model
                     await event.reply(f"ollama model → {OLLAMA_MODEL}")
+                elif TEXT_BACKEND == "groq":
+                    global GROQ_MODEL
+                    GROQ_MODEL = new_model
+                    await event.reply(f"groq model → {GROQ_MODEL}")
                 else:
                     global VENICE_MODEL
                     VENICE_MODEL = new_model
                     await event.reply(f"venice model → {VENICE_MODEL}")
                 return
 
-            # "vision model <name>" — sets the vision model
             vision_match = re.match(r"vision\s+model\s+(\S+)", txt)
             if vision_match:
                 new_model = vision_match.group(1)
@@ -1095,13 +1150,16 @@ async def handle_message(event: events.NewMessage.Event) -> None:
                     global OLLAMA_VISION_MODEL
                     OLLAMA_VISION_MODEL = new_model
                     await event.reply(f"ollama vision model → {OLLAMA_VISION_MODEL}")
+                elif vb == "groq":
+                    global GROQ_VISION_MODEL
+                    GROQ_VISION_MODEL = new_model
+                    await event.reply(f"groq vision model → {GROQ_VISION_MODEL}")
                 else:
                     global VENICE_VISION_MODEL
                     VENICE_VISION_MODEL = new_model
                     await event.reply(f"venice vision model → {VENICE_VISION_MODEL}")
                 return
 
-            # "status" — show current backend and models
             if txt in ("status", "config", "settings"):
                 vb = VISION_BACKEND or TEXT_BACKEND
                 status_lines = [
@@ -1111,6 +1169,8 @@ async def handle_message(event: events.NewMessage.Event) -> None:
                     f"ollama vision: {OLLAMA_VISION_MODEL}",
                     f"venice text: {VENICE_MODEL}",
                     f"venice vision: {VENICE_VISION_MODEL}",
+                    f"groq text: {GROQ_MODEL}",
+                    f"groq vision: {GROQ_VISION_MODEL}",
                 ]
                 await event.reply("\n".join(status_lines))
                 return
